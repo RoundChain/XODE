@@ -1,3 +1,4 @@
+import math
 import socket
 import threading
 import json
@@ -1074,69 +1075,100 @@ class XodeNode:
         return len(json.dumps(block_dict, sort_keys=True, ensure_ascii=False).encode('utf-8'))
 
     def get_difficulty(self):
+        import math
+
         if len(self.chain) <= 1:
             return float(self.INITIAL_DIFFICULTY)
-        
-        current_index = len(self.chain)
-        
-        if current_index % self.DIFFICULTY_ADJUSTMENT_INTERVAL != 0:
+
+        N = 60
+        recent = self.chain[-N:]
+
+        if len(recent) < 2:
             return float(self.chain[-1].difficulty)
+
+        total_time = recent[-1].timestamp - recent[0].timestamp
+        avg_interval = total_time / max(1, len(recent) - 1)
+        avg_interval = max(self.BLOCK_TIME / 4, min(avg_interval, self.BLOCK_TIME * 10))
+        time_factor = math.log2(self.BLOCK_TIME / avg_interval)
+
+        producer_counts = {}
+        for block in recent:
+            reward_tx = getattr(block, 'reward_tx', {}) or {}
+            node = reward_tx.get("producer_node", "UNKNOWN")
+            producer_counts[node] = producer_counts.get(node, 0) + 1
+
+        total_blocks = len(recent)
+        producer_weights = {
+            node: count / total_blocks
+            for node, count in producer_counts.items()
+        }
+
+        online_producers = set()
+        if self.is_producer and self.server_address:
+            online_producers.add(self.server_address)
+
+        with self.peer_lock:
+            for sock, info in self.peer_sockets.items():
+                if info.get("is_producer") and info.get("connected"):
+                    addr = info.get("address", "")
+                    if addr and addr != self.server_address:
+                        online_producers.add(addr)
+
+        retained_ratio = sum(
+            producer_weights.get(addr, 0)
+            for addr in online_producers
+        )
+
+        dominant_node = max(producer_weights, key=producer_weights.get, default=None)
+        dominant_weight = producer_weights.get(dominant_node, 0) if dominant_node else 0
+        dominant_offline = dominant_node and dominant_node not in online_producers
+
+        if dominant_offline and dominant_weight > 0.5:
+            print(f"[HRPAD] 主导生产者 {dominant_node} 掉线，历史权重 {dominant_weight:.1%}", flush=True)
+
+        if len(producer_counts) == 0:
+            retained_ratio = 1.0
+        elif retained_ratio < 0.001:
+            retained_ratio = 0.01
+
+        hashrate_factor = math.log2(max(0.001, retained_ratio))
+        if dominant_offline and dominant_weight > 0.5:
+            hashrate_factor += math.log2(max(0.01, 1 - dominant_weight))
+
+        old_diff = float(self.chain[-1].difficulty)
+
+        is_emergency = dominant_offline and dominant_weight > 0.5 and retained_ratio < 0.2
+
+        if is_emergency:
+            scale = max(0.1, retained_ratio * 2)
+            emergency_diff = old_diff * scale
         
-        if current_index < self.DIFFICULTY_ADJUSTMENT_INTERVAL:
-            return float(self.INITIAL_DIFFICULTY)
+            if time_factor < -0.3:
+                emergency_diff *= 0.7
         
-        period_start_idx = current_index - self.DIFFICULTY_ADJUSTMENT_INTERVAL
-        period_start_block = self.chain[period_start_idx]
-        period_end_block = self.chain[-1]
+            floor = max(1.0, float(self.INITIAL_DIFFICULTY) * 0.9)
+            new_diff = max(floor, emergency_diff)
         
-        actual_time = max(1, period_end_block.timestamp - period_start_block.timestamp)
-        target_time = self.DIFFICULTY_ADJUSTMENT_INTERVAL * self.BLOCK_TIME
-        
-        old_difficulty = float(period_start_block.difficulty)
-        old_target = difficulty_to_target(old_difficulty)
-        new_target = int(old_target * actual_time / target_time)
-        max_target = old_target * 4
-        min_target = old_target // 4
-        new_target = max(min_target, min(max_target, new_target))
-        max_allowed_target = difficulty_to_target(1.0)
-        new_target = min(new_target, max_allowed_target)
-        new_difficulty = target_to_difficulty(new_target)
-        new_difficulty = max(1.0, new_difficulty)
-        
-        print(f"[难度调整] 周期 #{period_start_idx}-{current_index-1} 用时 {actual_time}s / 目标 {target_time}s, 旧难度 {old_difficulty:.4f} -> 新难度 {new_difficulty:.4f}", flush=True)
-        return new_difficulty
+            print(f"[HRPAD] 紧急跳水！保留比例 {retained_ratio:.1%}，算力因子 {hashrate_factor:.2f}，"
+                  f"{old_diff:.2f} 直接跳至 {new_diff:.2f}（保底 {floor:.2f}）", flush=True)
+            return float(new_diff)
+
+        raw_new_diff = old_diff + time_factor + hashrate_factor
+        max_change = 2.0
+        new_diff = max(old_diff - max_change, min(old_diff + max_change, raw_new_diff))
+        new_diff = max(1.0, min(250.0, new_diff))
+
+        print(f"[HRPAD] 旧难度:{old_diff:.4f} 时间:{time_factor:+.4f} 算力:{hashrate_factor:+.4f} "
+              f"平均间隔:{avg_interval:.0f}s 保留:{retained_ratio:.1%} 在线生产者:{len(online_producers)} "
+              f"-> 新难度:{new_diff:.4f}", flush=True)
+
+        return float(new_diff)
+
 
     def _get_expected_difficulty(self, block_index):
         if block_index <= 1:
             return float(self.INITIAL_DIFFICULTY)
-        
-        if block_index % self.DIFFICULTY_ADJUSTMENT_INTERVAL != 0:
-            if block_index - 1 < len(self.chain):
-                return float(self.chain[block_index - 1].difficulty)
-            return float(self.chain[-1].difficulty) if self.chain else float(self.INITIAL_DIFFICULTY)
-        
-        if block_index < self.DIFFICULTY_ADJUSTMENT_INTERVAL:
-            return float(self.INITIAL_DIFFICULTY)
-        
-        if block_index > len(self.chain):
-            return float(self.chain[-1].difficulty) if self.chain else float(self.INITIAL_DIFFICULTY)
-        
-        period_start_idx = block_index - self.DIFFICULTY_ADJUSTMENT_INTERVAL
-        period_start_block = self.chain[period_start_idx]
-        period_end_block = self.chain[block_index - 1]
-        
-        actual_time = max(1, period_end_block.timestamp - period_start_block.timestamp)
-        target_time = self.DIFFICULTY_ADJUSTMENT_INTERVAL * self.BLOCK_TIME
-        
-        old_difficulty = float(period_start_block.difficulty)
-        old_target = difficulty_to_target(old_difficulty)
-        new_target = int(old_target * actual_time / target_time)
-        max_target = old_target * 4
-        min_target = old_target // 4
-        new_target = max(min_target, min(max_target, new_target))
-        max_allowed_target = difficulty_to_target(1.0)
-        new_target = min(new_target, max_allowed_target)
-        return target_to_difficulty(new_target)
+        return self.get_difficulty()
 
     def _validate_block_pow(self, block):
         hash_int = int(block.hash, 16)
@@ -2660,7 +2692,7 @@ class XodeNode:
 
         remote_host = addr[0]
         if remote_host not in ('127.0.0.1', 'localhost'):
-            self._add_known_peer(remote_host, remote_port, remote_address)
+            self._add_known_peer(remote_host, remote_port, remote_address, init_data.get("is_producer", False))
             addr_tuple = (remote_host, remote_port)
             if addr_tuple not in self.peer_addrs:
                 self.peer_addrs.append(addr_tuple)
@@ -3478,10 +3510,12 @@ class XodeNode:
                     continue
                 seen.add(addr_str)
                 address = info.get("address", "")
+                is_producer = info.get("is_producer", False)
+                mode = "producer" if is_producer else "sync"
                 if address:
-                    peer_lines.append(f"{addr_str} {address}")
+                    peer_lines.append(f"{addr_str} {address} {mode}")
                 else:
-                    peer_lines.append(addr_str)
+                    peer_lines.append(f"{addr_str} {mode}")
 
             with open(PEERS_CONFIG_FILE, 'w', encoding='utf-8') as f:
                 for line in peer_lines:
@@ -3515,7 +3549,19 @@ class XodeNode:
 
                     parts = line.split()
                     host_port = parts[0]
-                    address = parts[1] if len(parts) > 1 else None
+                    address = None
+                    is_producer = False
+
+                    if len(parts) == 2:
+                        # 可能是旧格式 address，也可能是 mode
+                        if parts[1].lower() in ("producer", "sync"):
+                            is_producer = parts[1].lower() == "producer"
+                        else:
+                            address = parts[1]
+                    elif len(parts) >= 3:
+                        address = parts[1]
+                        mode = parts[2].lower()
+                        is_producer = mode == "producer"
 
                     if ":" in host_port:
                         host, port_str = host_port.rsplit(":", 1)
@@ -3551,15 +3597,19 @@ class XodeNode:
                         self.known_peers[addr_str] = {
                             "last_seen": 0,
                             "first_seen": time.time(),
-                            "address": address
+                            "address": address,
+                            "is_producer": is_producer
                         }
                     else:
                         if address:
                             self.known_peers[addr_str]["address"] = address
+                        self.known_peers[addr_str]["is_producer"] = is_producer
 
                     info = f"{host}:{port}"
                     if address:
                         info += f" ({address[:20]}...)"
+                    mode_str = "producer" if is_producer else "sync"
+                    info += f" [{mode_str}]"
                     print(f"[P2P种子] 从 peers.txt 加载: {info}", flush=True)
 
             if loaded > 0:
@@ -3597,7 +3647,7 @@ class XodeNode:
         except Exception as e:
             print(f"[P2P] 保存对等节点文件失败: {e}", flush=True)
 
-    def _add_known_peer(self, host, port, address=None):
+    def _add_known_peer(self, host, port, address=None, is_producer=None):
         addr_str = f"{host}:{port}"
         if host in ('127.0.0.1', 'localhost', '0.0.0.0', self.host):
             if port == self.port:
@@ -3606,18 +3656,41 @@ class XodeNode:
             return False
 
         if addr_str in self.known_peers:
-            self.known_peers[addr_str]["last_seen"] = time.time()
-            if address:
-                self.known_peers[addr_str]["address"] = address
+            info = self.known_peers[addr_str]
+            changed = False
+            info["last_seen"] = time.time()
+
+            # 地址更新检测
+            if address and info.get("address") != address:
+                old_addr = info.get("address", "unknown")
+                info["address"] = address
+                changed = True
+                print(f"[P2P] 节点 {addr_str} 地址更新: {old_addr} -> {address}", flush=True)
+
+            # 运行模式更新检测
+            if is_producer is not None and info.get("is_producer") != is_producer:
+                old_mode = "producer" if info.get("is_producer", False) else "sync"
+                new_mode = "producer" if is_producer else "sync"
+                info["is_producer"] = is_producer
+                changed = True
+                print(f"[P2P] 节点 {addr_str} 模式更新: {old_mode} -> {new_mode}", flush=True)
+
+            # 如果信息有变化，立即保存到文件
+            if changed:
+                self._save_known_peers()
+                self._save_peers_to_txt()
             return False
+
         self.known_peers[addr_str] = {
             "last_seen": time.time(),
             "address": address,
-            "first_seen": time.time()
+            "first_seen": time.time(),
+            "is_producer": is_producer if is_producer is not None else False
         }
         self._save_known_peers()
         self._save_peers_to_txt()
-        print(f"[P2P] 新增对等节点: {addr_str} (地址: {address or 'unknown'})", flush=True)
+        mode_str = "producer" if (is_producer if is_producer is not None else False) else "sync"
+        print(f"[P2P] 新增对等节点: {addr_str} (地址: {address or 'unknown'}, 模式: {mode_str})", flush=True)
         return True
 
     def _connect_to_peer(self, host, port):
@@ -3745,6 +3818,17 @@ class XodeNode:
                     self.peer_sockets[sock]["is_producer"] = msg.get("is_producer", False)
                     if remote_height >= 0:
                         self.peer_sockets[sock]["block_height"] = remote_height
+
+            # 同步更新 known_peers 中的地址和运行模式
+            remote_host = None
+            remote_port = None
+            with self.peer_lock:
+                if sock in self.peer_sockets:
+                    remote_host = self.peer_sockets[sock].get("host")
+                    remote_port = self.peer_sockets[sock].get("port")
+            if remote_host and remote_port:
+                self._add_known_peer(remote_host, remote_port, remote_address, msg.get("is_producer", False))
+
             sync_msg = {
                 "type": "node_chain_info",
                 "address": self.server_address,
@@ -3763,7 +3847,8 @@ class XodeNode:
                         peers_list.append({
                             "host": host,
                             "port": int(port),
-                            "address": info.get("address")
+                            "address": info.get("address"),
+                            "is_producer": info.get("is_producer", False)
                         })
             peers_msg = {
                 "type": "node_peers",
@@ -3791,8 +3876,9 @@ class XodeNode:
                 host = peer_info.get("host")
                 port = peer_info.get("port")
                 peer_address = peer_info.get("address")
+                peer_is_producer = peer_info.get("is_producer", False)
                 if host and port:
-                    added = self._add_known_peer(host, port, peer_address)
+                    added = self._add_known_peer(host, port, peer_address, peer_is_producer)
                     if not added:
                         continue
                     new_count += 1
