@@ -1,0 +1,48 @@
+{
+  "chain": [
+    {
+      "index": 0,
+      "timestamp": 0,
+      "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hash": "d5616be21779e7c796bf839d9288ace717b1d19940c3fd6ccaac199dc92179e1",
+      "reward_tx": {
+        "total": 1000,
+        "online_count": 0,
+        "ineligible_count": 0,
+        "producer_node": "XODEACM95jmytKw4BKtX",
+        "producer_eligible": false,
+        "producer_reward": 0.0,
+        "producer_reward_atomic": 0,
+        "reward_per_user": 0.0,
+        "reward_per_user_atomic": 0,
+        "burned": 1000,
+        "burned_atomic": 100000000000,
+        "burn_address": "XODE0000000000000000",
+        "recipients": [
+          {
+            "address": "XODE0000000000000000",
+            "amount": 1000,
+            "amount_atomic": 100000000000
+          }
+        ]
+      },
+      "transactions": [],
+      "nonce": 0,
+      "difficulty": 24.0
+    }
+  ],
+  "balances": {
+    "XODE0000000000000000": 100000000000
+  },
+  "total_issued": 100000000000,
+  "transaction_history": {},
+  "address_nonces": {},
+  "ip_bindings": {},
+  "address_first_seen_block": {},
+  "daily_transfer_stats": {},
+  "pending_rewards": {},
+  "pending_transfers": {},
+  "pending_transactions": [],
+  "saved_at": 1787374905.8611817,
+  "version": "xode"
+}
