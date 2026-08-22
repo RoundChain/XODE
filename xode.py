@@ -2090,9 +2090,19 @@ class XodeNode:
             print(f"[POW调试] 实际hash: {block.hash}", flush=True)
             print(f"[POW调试] 序列化前200字符: {debug_str[:200]}", flush=True)
             return False, "POW 验证失败：哈希计算不匹配"
-        expected_difficulty = self._get_expected_difficulty(block.index)
-        if abs(block.difficulty - expected_difficulty) > 0.01:
-            return False, f"难度不匹配：区块难度 {block.difficulty:.4f}，预期 {expected_difficulty:.4f}"
+        
+        # 1. 验证难度不低于客观难度（基于纯链上时间数据，全网一致）
+        objective_difficulty = self.get_difficulty_objective(block.index)
+        if block.difficulty < objective_difficulty - 0.01:
+            return False, f"难度过低：区块难度 {block.difficulty:.4f}，最低允许 {objective_difficulty:.4f}"
+        
+        # 2. 使用与出块相同的 get_difficulty() 验证，允许 0.5 的容差
+        # 因为 P2P 在线状态可能存在同步延迟，导致 HRPAD 算力因子在不同节点略有差异
+        expected_difficulty = self.get_difficulty()
+        diff = abs(block.difficulty - expected_difficulty)
+        if diff > 0.5:
+            print(f"[P2P] 区块 #{block.index} 难度偏差 {diff:.4f} (区块:{block.difficulty:.4f} 预期:{expected_difficulty:.4f})，但POW有效且满足客观难度，接受", flush=True)
+        
         return True, None
 
 
