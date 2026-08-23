@@ -2091,7 +2091,8 @@ class XodeNode:
             print(f"[POW调试] 序列化前200字符: {debug_str[:200]}", flush=True)
             return False, "POW 验证失败：哈希计算不匹配"
         
-        # 同步期间，网络已承认的区块只需验证 PoW 满足自身声明的难度即可
+                # 同步期间，网络已承认的区块只需验证 PoW 满足自身声明的难度即可
+        # 本地链可能不完整，此时用本地状态复核难度调整规则会产生误杀
         if self.syncing:
             return True, None
 
@@ -2294,7 +2295,7 @@ class XodeNode:
                         chain_built = True
                         break
                 else:
-                    # 清理整条劣势分支
+                    # 孤儿链已确认无法超越主链，清理整条劣势分支
                     removed = self._purge_orphan_branch(h)
                     if removed > 0:
                         print(f"[P2P孤儿] 清理劣势孤儿链 {h[:16]}...，共 {removed} 个区块", flush=True)
@@ -2348,7 +2349,7 @@ class XodeNode:
         current = tail_hash
         removed = 0
         while current and current in self.orphan_blocks:
-            #这里是分叉点，停止删除
+            # 如果当前块还被其他孤儿块当父块，说明这里是分叉点，停止删除
             has_children = any(
                 bd.get("previous_hash") == current
                 for bd in self.orphan_blocks.values()
@@ -4693,7 +4694,7 @@ class XodeNode:
                 "address": self.server_address,
                 "public_key": self.server_public_key,
                 "port": self.port,
-                "is_producer": self.is_producer,
+                "is_producer": self.local_hashrate > 0,
                 "block_height": len(self.chain) - 1,
                 "nonce": self.node_nonce
             }
@@ -4800,7 +4801,8 @@ class XodeNode:
             with self.peer_lock:
                 if sock in self.peer_sockets:
                     self.peer_sockets[sock]["address"] = remote_address
-                    self.peer_sockets[sock]["is_producer"] = msg.get("is_producer", False)
+                    self.peer_sockets[sock]["is_producer"] = False  # 不直接信任version声明，等待算力报告
+                    self.peer_sockets[sock]["hashrate"] = 0
                     if remote_height >= 0:
                         self.peer_sockets[sock]["block_height"] = remote_height
 
@@ -4901,7 +4903,13 @@ class XodeNode:
             if addr and addr != self.server_address:
                 with self.peer_lock:
                     self.peer_hashrates[addr] = {"hashrate": hr, "last_seen": time.time()}
-                print(f"[P2P] 收到节点 {addr} 算力: {hr} h/s", flush=True)
+                    # 根据算力值判断是否为出块节点
+                    for peer_info in self.peer_sockets.values():
+                        if peer_info.get("address") == addr:
+                            peer_info["hashrate"] = hr
+                            peer_info["is_producer"] = hr > 0
+                            break
+                print(f"[P2P] 收到节点 {addr} 算力: {hr} h/s (出块节点: {hr > 0})", flush=True)
 
         elif msg_type == "node_online_users":
             remote_users = msg.get("users", [])
@@ -4949,7 +4957,7 @@ class XodeNode:
                         "address": source_node,
                         "last_seen": current_time,
                         "proof_timestamp": proof_timestamp,
-                        "is_producer": user_info.get("is_producer", False),
+                        "is_producer": user_info.get("hashrate", 0) > 0,
                         "hashrate": user_info.get("hashrate", 0)
                     }
                     self.online_proofs[addr] = proof
@@ -5665,7 +5673,7 @@ class XodeNode:
                     "unbind_time": None,
                     "online_proof": my_proof,
                     "source_node": self.server_address,
-                    "is_producer": self.is_producer,
+                    "is_producer": self.local_hashrate > 0,
                     "hashrate": self.local_hashrate
                 })
                 local_addrs.add(self.server_address)
@@ -5948,7 +5956,7 @@ class XodeNode:
                     )
                     connected_producers = sum(
                         1 for info in self.peer_sockets.values()
-                        if info.get("is_producer") and info.get("connected")
+                        if info.get("hashrate", 0) > 0 and info.get("connected")
                     )
 
                 # 退出预热条件：
@@ -6205,7 +6213,7 @@ class XodeNode:
         with self.lock:
             current_time = time.time()
             for addr, info in self.all_online_users.items():
-                if addr != self.server_address and info.get("is_producer"):
+                if addr != self.server_address and info.get("hashrate", 0) > 0:
                     if current_time - info.get("last_seen", 0) <= self.ONLINE_PROOF_VALIDITY:
                         producer_count += 1
 
