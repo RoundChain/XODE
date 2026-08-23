@@ -56,7 +56,7 @@ MAX_TRANSFER_AMOUNT = 10_000_000_000_000_000
 MAX_DAILY_TRANSFER_COUNT = 1000
 MAX_DAILY_TRANSFER_AMOUNT = 100_000_000_000_000_000
 
-MAX_ORPHAN_BLOCKS = 100
+MAX_ORPHAN_BLOCKS = 5000
 MAX_HEADERS_RESULTS = 2000
 MAX_BLOCKS_PER_GETDATA = 100
 MAX_INV_SIZE = 50000
@@ -2091,18 +2091,20 @@ class XodeNode:
             print(f"[POW调试] 序列化前200字符: {debug_str[:200]}", flush=True)
             return False, "POW 验证失败：哈希计算不匹配"
         
-        # 1. 验证难度不低于客观难度（基于纯链上时间数据，全网一致）
+        # 同步期间，网络已承认的区块只需验证 PoW 满足自身声明的难度即可
+        if self.syncing:
+            return True, None
+
+        # 非同步期间（正常运行/出块），严格执行难度规则
         objective_difficulty = self.get_difficulty_objective(block.index)
         if block.difficulty < objective_difficulty - 0.01:
             return False, f"难度过低：区块难度 {block.difficulty:.4f}，最低允许 {objective_difficulty:.4f}"
-        
-        # 2. 使用与出块相同的 get_difficulty() 验证，允许 0.5 的容差
-        # 因为 P2P 在线状态可能存在同步延迟，导致 HRPAD 算力因子在不同节点略有差异
+
         expected_difficulty = self.get_difficulty()
         diff = abs(block.difficulty - expected_difficulty)
         if diff > 0.5:
             print(f"[P2P] 区块 #{block.index} 难度偏差 {diff:.4f} (区块:{block.difficulty:.4f} 预期:{expected_difficulty:.4f})，但POW有效且满足客观难度，接受", flush=True)
-        
+
         return True, None
 
 
@@ -2291,6 +2293,11 @@ class XodeNode:
                     if self._switch_to_orphan_chain(h):
                         chain_built = True
                         break
+                else:
+                    # 清理整条劣势分支
+                    removed = self._purge_orphan_branch(h)
+                    if removed > 0:
+                        print(f"[P2P孤儿] 清理劣势孤儿链 {h[:16]}...，共 {removed} 个区块", flush=True)
 
         if len(self.orphan_blocks) > MAX_ORPHAN_BLOCKS:
             sorted_orphans = sorted(self.orphan_blocks.items(),
@@ -2335,6 +2342,24 @@ class XodeNode:
                 visited.add(current)
             else:
                 return -1
+
+    def _purge_orphan_branch(self, tail_hash):
+        """从 tail 向上删除劣势孤儿链，遇到分叉（有其他子块引用）即停"""
+        current = tail_hash
+        removed = 0
+        while current and current in self.orphan_blocks:
+            #这里是分叉点，停止删除
+            has_children = any(
+                bd.get("previous_hash") == current
+                for bd in self.orphan_blocks.values()
+            )
+            if has_children:
+                break
+            prev = self.orphan_blocks[current].get("previous_hash")
+            del self.orphan_blocks[current]
+            removed += 1
+            current = prev
+        return removed
 
     def _switch_to_orphan_chain(self, tail_hash):
         orphan_chain = []
@@ -2676,6 +2701,13 @@ class XodeNode:
         idx = block_data.get("index")
         h = block_data.get("hash")
         prev = block_data.get("previous_hash")
+        local_height = len(self.chain) - 1
+
+        # 同步期间，远超本地的未来广播块直接丢弃，不污染孤儿池
+        if self.syncing and not self.headers_synced:
+            if idx > local_height + 50:
+                print(f"[P2P同步] 丢弃未来广播区块 #{idx}，本地仅 #{local_height}", flush=True)
+                return False
 
         if h in self.block_inventory:
             return True
