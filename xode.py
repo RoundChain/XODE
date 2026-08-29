@@ -31,7 +31,7 @@ CLIENT_FILE = "client.txt"
 HISTORY_FILE = "my_history.json"
 
 MAGIC = b'XODE'
-MAX_PAYLOAD_SIZE = 2_000_000
+MAX_PAYLOAD_SIZE = 20_000_000
 
 MAX_TX_PER_BLOCK = 1000
 MAX_BLOCK_SIZE = 10_000_000
@@ -57,10 +57,10 @@ MAX_DAILY_TRANSFER_COUNT = 1000
 MAX_DAILY_TRANSFER_AMOUNT = 100_000_000_000_000_000
 
 MAX_ORPHAN_BLOCKS = 5000
-MAX_HEADERS_RESULTS = 2000
-MAX_BLOCKS_PER_GETDATA = 100
+MAX_HEADERS_RESULTS = 500
+MAX_BLOCKS_PER_GETDATA = 5
 MAX_INV_SIZE = 50000
-SYNC_TIMEOUT = 120
+SYNC_TIMEOUT = 3600
 
 
 def _load_json_data():
@@ -269,7 +269,7 @@ def verify_signature(public_key_hex, message, signature_hex, timestamp=None):
     try:
         if timestamp is not None:
             current_time = time.time()
-            if abs(current_time - timestamp) > 36000:
+            if abs(current_time - timestamp) > 3600000000000000000000000000000000:
                 print(f"[签名验证] 时间戳过期: {timestamp}, 当前: {current_time}", flush=True)
                 return False
         public_key = _load_ecdsa_public_key(public_key_hex)
@@ -338,7 +338,6 @@ def build_sign_message(from_addr, to_addr, amount, nonce, timestamp=None):
 
 
 def compute_block_hash(index, timestamp, previous_hash, reward_tx, transactions, nonce, difficulty):
-    """计算确定性区块哈希"""
     clean_reward = None
     if reward_tx:
         clean_reward = {
@@ -965,7 +964,6 @@ const reward=block.reward||block.reward_tx||{},supply=block.supply||{},txs=block
 const date=new Date(block.timestamp*1000).toLocaleString();
 const perUser=reward.per_user||reward.reward_per_user||0;
 
-// 奖励信息 - 4列紧凑布局
 let rewardHtml='';
 const recipients=reward.recipients||[];
 if(recipients.length>0){
@@ -982,7 +980,6 @@ rewardHtml+='</div>';
 rewardHtml+='</div></div>';
 }
 
-// 交易详情
 let txHtml='';
 if(txs.length>0){
 txHtml='<div style="background:rgba(0,0,0,0.15);border:1px solid rgba(255,255,255,0.05);border-radius:8px;padding:8px 10px;margin-bottom:8px">';
@@ -1008,20 +1005,17 @@ txHtml+='</tr>';
 txHtml+='</table></div>';
 }
 
-// 区块头部 - 显示完整hash
 html+='<div class="block-card" style="padding:12px;margin-bottom:8px">';
 html+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
 html+='<span style="font-size:16px;font-weight:800;color:#00d4ff">#'+block.index+'</span>';
 html+='<span style="font-family:monospace;font-size:10px;color:#4a5568">'+hl(block.hash)+'</span>';
 html+='</div>';
 
-// Hash信息
 html+='<div style="font-size:10px;font-family:monospace;color:#4a5568;margin-bottom:8px;line-height:1.6">';
 html+='<div><span style="color:#6b7a8f">Hash:</span> <span style="color:#00d4ff">'+hl(block.hash)+'</span></div>';
 html+='<div><span style="color:#6b7a8f">Prev:</span> <span style="color:#a855f7">'+hl(block.previous_hash||'Genesis')+'</span></div>';
 html+='</div>';
 
-// 元信息行
 html+='<div style="display:flex;gap:14px;font-size:11px;color:#6b7a8f;flex-wrap:wrap;margin-bottom:8px">';
 html+='<span>⏰ '+date+'</span>';
 if(supply.issued){html+='<span>📊 '+parseFloat(supply.issued)+'</span>';}
@@ -1029,7 +1023,6 @@ if(supply.burned_total||supply.burned_total===0){html+='<span>🔥 Burned: '+par
 html+='<span>👥 '+(reward.online_count||0)+' online</span>';
 html+='</div>';
 
-// 奖励在上，交易在下
 html+=rewardHtml;
 html+=txHtml;
 
@@ -1370,6 +1363,8 @@ class XodeNode:
         self.last_block_time = 0
         self.best_known_height = -1
         self.sync_lock = threading.RLock()
+        self.sync_block_queue = []
+        self.sync_peer = None
 
         self.peers_file = "xode_peers.json"
         self.known_peers = {}
@@ -2091,12 +2086,9 @@ class XodeNode:
             print(f"[POW调试] 序列化前200字符: {debug_str[:200]}", flush=True)
             return False, "POW 验证失败：哈希计算不匹配"
         
-                # 同步期间，网络已承认的区块只需验证 PoW 满足自身声明的难度即可
-        # 本地链可能不完整，此时用本地状态复核难度调整规则会产生误杀
         if self.syncing:
             return True, None
 
-        # 非同步期间（正常运行/出块），严格执行难度规则
         objective_difficulty = self.get_difficulty_objective(block.index)
         if block.difficulty < objective_difficulty - 0.01:
             return False, f"难度过低：区块难度 {block.difficulty:.4f}，最低允许 {objective_difficulty:.4f}"
@@ -2148,6 +2140,7 @@ class XodeNode:
         with self.sync_lock:
             needed_blocks = []
             last_connected = None
+            is_last_batch = len(headers) < MAX_HEADERS_RESULTS
 
             for header in headers:
                 idx = header.get("index")
@@ -2177,13 +2170,26 @@ class XodeNode:
                     print(f"[P2P同步] 区块头 #{idx} {h[:16]}... 无法连接，跳过", flush=True)
 
             if needed_blocks:
-                print(f"[P2P同步] 需要下载 {len(needed_blocks)} 个完整区块", flush=True)
-                self._request_blocks_by_hashes(peer_sock, needed_blocks)
+                # 追加到同步队列（去重且保持顺序）
+                existing = set(self.sync_block_queue)
+                added = 0
+                for h in needed_blocks:
+                    if h not in existing and h not in self.block_inventory and h not in self.pending_block_requests:
+                        self.sync_block_queue.append(h)
+                        existing.add(h)
+                        added += 1
+                print(f"[P2P同步] 队列新增 {added} 个区块，队列总长 {len(self.sync_block_queue)}", flush=True)
+                if is_last_batch:
+                    self.headers_synced = True
+                    print(f"[P2P同步] 所有 headers 已接收，队列共 {len(self.sync_block_queue)} 个区块待下载", flush=True)
+
+                self._request_next_sync_batch(peer_sock)
             else:
                 print(f"[P2P同步] 所有区块头已存在或无法连接", flush=True)
-                if len(headers) < MAX_HEADERS_RESULTS:
+                if is_last_batch:
                     self.headers_synced = True
-                    self.syncing = False
+                    if not self.sync_block_queue and not self.pending_block_requests:
+                        self.syncing = False
                     print(f"[P2P同步] Headers 同步完成，链高度 #{len(self.chain)-1}", flush=True)
 
     def _request_blocks_by_hashes(self, sock, hashes):
@@ -2201,6 +2207,36 @@ class XodeNode:
                 for h in batch:
                     self.pending_block_requests.add(h)
                 print(f"[P2P同步] 请求 {len(batch)} 个区块 (getdata)", flush=True)
+            except Exception as e:
+                print(f"[P2P同步] 发送 getdata 失败: {e}", flush=True)
+
+    def _request_next_sync_batch(self, sock):
+        with self.sync_lock:
+            slots = max(0, MAX_BLOCKS_PER_GETDATA - len(self.pending_block_requests))
+            if slots <= 0:
+                return
+            to_request = []
+            for h in list(self.sync_block_queue):
+                if h in self.block_inventory:
+                    self.sync_block_queue.remove(h)
+                    continue
+                if h not in self.pending_block_requests:
+                    to_request.append(h)
+                    if len(to_request) >= slots:
+                        break
+            if not to_request:
+                return
+            msg = {
+                "type": "getdata",
+                "address": self.server_address,
+                "inventory": [{"type": "block", "hash": h} for h in to_request]
+            }
+            try:
+                sock.sendall(encode_message(msg))
+                for h in to_request:
+                    self.pending_block_requests.add(h)
+                print(f"[P2P同步] 流水线请求 {len(to_request)} 个区块 "
+                      f"(pending:{len(self.pending_block_requests)} 队列剩余:{len(self.sync_block_queue)})", flush=True)
             except Exception as e:
                 print(f"[P2P同步] 发送 getdata 失败: {e}", flush=True)
 
@@ -2295,7 +2331,6 @@ class XodeNode:
                         chain_built = True
                         break
                 else:
-                    # 孤儿链已确认无法超越主链，清理整条劣势分支
                     removed = self._purge_orphan_branch(h)
                     if removed > 0:
                         print(f"[P2P孤儿] 清理劣势孤儿链 {h[:16]}...，共 {removed} 个区块", flush=True)
@@ -2345,11 +2380,9 @@ class XodeNode:
                 return -1
 
     def _purge_orphan_branch(self, tail_hash):
-        """从 tail 向上删除劣势孤儿链，遇到分叉（有其他子块引用）即停"""
         current = tail_hash
         removed = 0
         while current and current in self.orphan_blocks:
-            # 如果当前块还被其他孤儿块当父块，说明这里是分叉点，停止删除
             has_children = any(
                 bd.get("previous_hash") == current
                 for bd in self.orphan_blocks.values()
@@ -4098,8 +4131,8 @@ class XodeNode:
                         try:
                             start_idx = msg_data.get("start", 0)
                             end_idx = msg_data.get("end", len(self.chain))
-                            if end_idx - start_idx > 100:
-                                end_idx = start_idx + 100
+                            if end_idx - start_idx > 10:
+                                end_idx = start_idx + 10
                             chain_data = []
                             for i in range(start_idx, min(end_idx, len(self.chain))):
                                 block = self.chain[i]
@@ -4731,7 +4764,7 @@ class XodeNode:
         buffer = b""
         while self.running:
             try:
-                data = sock.recv(8192)
+                data = sock.recv(65536)
                 if not data:
                     break
                 buffer += data
@@ -4801,12 +4834,11 @@ class XodeNode:
             with self.peer_lock:
                 if sock in self.peer_sockets:
                     self.peer_sockets[sock]["address"] = remote_address
-                    self.peer_sockets[sock]["is_producer"] = False  # 不直接信任version声明，等待算力报告
+                    self.peer_sockets[sock]["is_producer"] = False
                     self.peer_sockets[sock]["hashrate"] = 0
                     if remote_height >= 0:
                         self.peer_sockets[sock]["block_height"] = remote_height
 
-            # 同步更新 known_peers 中的地址和运行模式
             remote_host = None
             remote_port = None
             with self.peer_lock:
@@ -4903,7 +4935,6 @@ class XodeNode:
             if addr and addr != self.server_address:
                 with self.peer_lock:
                     self.peer_hashrates[addr] = {"hashrate": hr, "last_seen": time.time()}
-                    # 根据算力值判断是否为出块节点
                     for peer_info in self.peer_sockets.values():
                         if peer_info.get("address") == addr:
                             peer_info["hashrate"] = hr
@@ -5071,11 +5102,25 @@ class XodeNode:
                 if sock in self.peer_sockets:
                     self.peer_sockets[sock]["block_height"] = remote_height
 
-            if remote_height > local_height:
-                print(f"[P2P] 节点 {remote_address} 高度 {remote_height} > 本地 {local_height}，请求 headers", flush=True)
+            should_sync = False
+            with self.peer_lock:
+                if sock in self.peer_sockets:
+                    info = self.peer_sockets[sock]
+                    last_sync = info.get("last_sync_time", 0)
+                    if (remote_height > local_height and 
+                        not self.syncing and 
+                        time.time() - last_sync > 60):
+                        info["last_sync_time"] = time.time()
+                        should_sync = True
+
+            if should_sync:
+                print(f"[P2P] 节点 {remote_address} 高度 {remote_height} > 本地 {local_height}，启动一次同步", flush=True)
                 self._request_headers_from_peer(sock)
             else:
-                print(f"[P2P] 节点 {remote_address} 高度 {remote_height}，本地 {local_height}", flush=True)
+                if remote_height > local_height:
+                    print(f"[P2P] 节点 {remote_address} 高度 {remote_height}，本地 {local_height} (同步冷却中或已在同步)", flush=True)
+                else:
+                    print(f"[P2P] 节点 {remote_address} 高度 {remote_height}，本地 {local_height}", flush=True)
 
         elif msg_type == "node_get_blocks":
             try:
@@ -5116,6 +5161,14 @@ class XodeNode:
                 self._handle_block_message(sock, {"type": "block", "block": block_data})
 
     def _handle_getheaders(self, sock, msg):
+        # 频率限制：单个对等节点 5 秒内只能请求一次
+        with self.peer_lock:
+            if sock in self.peer_sockets:
+                last = self.peer_sockets[sock].get("last_getheaders", 0)
+                if time.time() - last < 5:
+                    return
+                self.peer_sockets[sock]["last_getheaders"] = time.time()
+
         locator = msg.get("locator", [])
         hashstop = msg.get("hashstop", "0" * 64)
 
@@ -5237,6 +5290,15 @@ class XodeNode:
 
         success = self._try_connect_block(block_data)
 
+        # 流水线调度
+        if self.syncing and self.sync_peer:
+            with self.sync_lock:
+                if h in self.sync_block_queue:
+                    self.sync_block_queue.remove(h)
+                pending_now = len(self.pending_block_requests)
+            if pending_now < MAX_BLOCKS_PER_GETDATA:
+                self._request_next_sync_batch(self.sync_peer)
+
         if success:
             inv_msg = {
                 "type": "inv",
@@ -5253,7 +5315,13 @@ class XodeNode:
 
             self._print_synced_block(block_data)
     
+        # 同步期间每处理一个区块都尝试连接孤儿块，防止顺序错乱导致卡住
         self._process_orphan_blocks()
+
+        with self.sync_lock:
+            if self.syncing and len(self.pending_block_requests) == 0 and len(self.orphan_blocks) > 0:
+                print(f"[P2P同步] 待下载区块已清空，但孤儿池还有 {len(self.orphan_blocks)} 个，尝试连接...", flush=True)
+                self._process_orphan_blocks()
 
     def _print_synced_block(self, block_data):
         idx = block_data.get("index", 0)
@@ -5504,8 +5572,8 @@ class XodeNode:
 
         with self.sync_lock:
             self.syncing = True
-            self.headers_synced = False
             self.sync_start_time = time.time()
+            self.sync_peer = None
 
         best_peer = None
         best_height = -1
@@ -5520,35 +5588,89 @@ class XodeNode:
             print(f"[P2P同步] 本地高度 {local_height} 已是最新，无需同步", flush=True)
             with self.sync_lock:
                 self.syncing = False
-                self.headers_synced = True
             if not self.chain:
                 self.create_genesis_block()
             return
 
-        if best_peer:
-            peer_info = self.peer_sockets.get(best_peer, {})
-            print(f"[P2P同步] 从节点 {peer_info.get('host', '?')}:{peer_info.get('port', '?')} 同步，远程高度: {best_height}", flush=True)
-            self._request_headers_from_peer(best_peer)
-
-            wait_start = time.time()
-            while self.running:
-                with self.sync_lock:
-                    if self.headers_synced:
-                        break
-                    if time.time() - self.sync_start_time > SYNC_TIMEOUT:
-                        print("[P2P同步] 同步超时，标记完成", flush=True)
-                        self.syncing = False
-                        self.headers_synced = True
-                        break
-                time.sleep(0.5)
-
-            print(f"[P2P同步] 同步结束，本地高度: {len(self.chain)-1}", flush=True)
-            self._recalc_total_issued_from_chain()
-            self.save_data()
-        else:
+        if not best_peer:
             print("[P2P同步] 无法找到合适的同步节点", flush=True)
+            with self.sync_lock:
+                self.syncing = False
             if not self.chain:
                 self.create_genesis_block()
+            return
+
+        peer_info = self.peer_sockets.get(best_peer, {})
+        print(f"[P2P同步] 从节点 {peer_info.get('host', '?')}:{peer_info.get('port', '?')} 同步，远程高度: {best_height}", flush=True)
+        self.sync_peer = best_peer
+
+        # 直接分批请求缺失的完整区块
+        batch_size = 50
+        last_height = local_height
+        stall_time = time.time()
+        last_progress_report = time.time()
+        re_request_count = 0
+        max_re_requests = 10
+
+        for start in range(local_height + 1, best_height + 1, batch_size):
+            end = min(start + batch_size, best_height + 1)
+            msg = {
+                "type": "node_get_blocks",
+                "start": start,
+                "end": end
+            }
+            try:
+                best_peer.sendall(encode_message(msg))
+                print(f"[P2P同步] 请求区块 #{start} ~ #{end - 1}", flush=True)
+            except Exception as e:
+                print(f"[P2P同步] 请求区块失败: {e}", flush=True)
+                break
+
+            waited = 0
+            while self.running:
+                time.sleep(0.3)
+                waited += 1
+                current_height = len(self.chain) - 1
+
+                if current_height >= end - 1:
+                    break
+
+                if waited > 100:  # 30秒超时
+                    re_request_count += 1
+                    if re_request_count > max_re_requests:
+                        print(f"[P2P同步] 重试次数超限({max_re_requests})，放弃同步", flush=True)
+                        with self.sync_lock:
+                            self.syncing = False
+                            self.sync_peer = None
+                        return
+                    print(f"[P2P同步] 区块 #{start}~#{end-1} 下载停滞，第{re_request_count}次重试...", flush=True)
+                    try:
+                        best_peer.sendall(encode_message(msg))
+                    except Exception as e:
+                        print(f"[P2P同步] 重试请求失败: {e}", flush=True)
+                        break
+                    waited = 0
+                    stall_time = time.time()
+
+                if time.time() - last_progress_report > 3:
+                    progress_pct = min(100, int((current_height / max(best_height, 1)) * 100))
+                    print(f"[P2P同步] 进度 {progress_pct}% | 高度 #{current_height}/{best_height}", flush=True)
+                    last_progress_report = time.time()
+
+                if time.time() - self.sync_start_time > SYNC_TIMEOUT:
+                    print("[P2P同步] 同步超时，标记完成", flush=True)
+                    break
+
+            if not self.running:
+                break
+
+        current_height = len(self.chain) - 1
+        print(f"[P2P同步] 同步结束，本地高度: #{current_height}", flush=True)
+        with self.sync_lock:
+            self.syncing = False
+            self.sync_peer = None
+        self._recalc_total_issued_from_chain()
+        self.save_data()
 
     def _broadcast_to_peers(self, msg_dict):
         data = encode_message(msg_dict)
@@ -5799,13 +5921,7 @@ class XodeNode:
             msg = {"type": "node_ping", "address": self.server_address, "timestamp": time.time()}
             self._broadcast_to_peers(msg)
 
-            chain_info = {
-                "type": "node_chain_info",
-                "address": self.server_address,
-                "block_height": len(self.chain) - 1,
-                "latest_hash": self.chain[-1].hash if self.chain else "0" * 64
-            }
-            self._broadcast_to_peers(chain_info)
+            # 高度信息在 version 握手时已交换，后续靠新块 inv 广播即可
 
             hashrate_msg = {
                 "type": "node_hashrate",
@@ -6030,7 +6146,6 @@ class XodeNode:
             idx = block.index
             ts = block.timestamp
 
-            # Check reward_tx recipients
             reward_tx = block.reward_tx or {}
             for r in reward_tx.get("recipients", []):
                 addr = r.get("address")
@@ -6056,7 +6171,6 @@ class XodeNode:
                         "maturity_block": idx + REWARD_CONFIRMATIONS
                     })
 
-            # Check transactions
             for tx in block.transactions:
                 tx_from = tx.get("from")
                 tx_to = tx.get("to")
@@ -6070,7 +6184,6 @@ class XodeNode:
                         tx_copy["direction"] = "in"
                     history.append(tx_copy)
 
-        # Sort by block_index ascending
         history.sort(key=lambda x: (x.get("block_index", 0), x.get("timestamp", 0)))
         self.address_history = history
         self.save_address_history()
@@ -6541,15 +6654,13 @@ if __name__ == "__main__":
     # 如果没有传入任何命令行参数（双击启动），则提供交互式选择
     if len(sys.argv) == 1:
         print("=" * 60, flush=True)
-        print("           XODE 区块链节点启动器", flush=True)
+        print("           XODE NODE           ", flush=True)
         print("=" * 60, flush=True)
         print("请选择节点运行模式:", flush=True)
         print("", flush=True)
         print("  [1] 出块节点 (Producer)", flush=True)
-        print("      参与 POW", flush=True)
         print("", flush=True)
         print("  [2] 同步节点 (Sync)", flush=True)
-        print("      仅同步区块链数据", flush=True)
         print("=" * 60, flush=True)
         
         while True:
