@@ -1,0 +1,37 @@
+XODE
+
+Language: Python
+
+Public Block Producing Node: SHA256
+
+Public Synchronization Node: Proof of Online
+
+Target Block Time: 2 minutes
+
+Dynamic Difficulty Adjustment: Every 10 blocks
+
+Total Coins: 2.1 billion
+
+Block Reward: 1K
+
+Block Transfer: 6 blocks
+
+Block Reward: 30 blocks
+
+Transaction Fee: 1 (sent to the burn address)
+
+Genesis Block Reward: 1000 (sent to the burn address)
+
+Block Reward Distribution 28 Model (fundamentally breaks the monopoly of traditional blockchain "block producer exclusive")
+
+Public Block Producing Node (POW) receives 1000 * 20% = 200
+
+All non-block producing public nodes and clients share 1000 * 80% = 800
+
+Participation in Block Reward Distribution: 15 blocks
+
+IP Binding Mechanism: 1 IP = 1 xode address
+
+IP Cooldown Mechanism: 1 hour
+
+Built-in local web block explorer
