@@ -2085,7 +2085,7 @@ class XodeNode:
             print(f"[POW调试] 实际hash: {block.hash}", flush=True)
             print(f"[POW调试] 序列化前200字符: {debug_str[:200]}", flush=True)
             return False, "POW 验证失败：哈希计算不匹配"
-        
+
         if self.syncing:
             return True, None
 
@@ -2170,7 +2170,6 @@ class XodeNode:
                     print(f"[P2P同步] 区块头 #{idx} {h[:16]}... 无法连接，跳过", flush=True)
 
             if needed_blocks:
-                # 追加到同步队列（去重且保持顺序）
                 existing = set(self.sync_block_queue)
                 added = 0
                 for h in needed_blocks:
@@ -2182,7 +2181,6 @@ class XodeNode:
                 if is_last_batch:
                     self.headers_synced = True
                     print(f"[P2P同步] 所有 headers 已接收，队列共 {len(self.sync_block_queue)} 个区块待下载", flush=True)
-
                 self._request_next_sync_batch(peer_sock)
             else:
                 print(f"[P2P同步] 所有区块头已存在或无法连接", flush=True)
@@ -2656,7 +2654,6 @@ class XodeNode:
         return True, None
 
     def _validate_reward_tx(self, reward_tx, block_index):
-        # 优先使用整数原子单位，完全忽略浮点字段，确保全网验证绝对一致
         total_atomic = reward_tx.get("total_atomic")
         if total_atomic is None:
             total_atomic = to_atomic(reward_tx.get("total", 0))
@@ -2737,7 +2734,6 @@ class XodeNode:
         prev = block_data.get("previous_hash")
         local_height = len(self.chain) - 1
 
-        # 同步期间，远超本地的未来广播块直接丢弃，不污染孤儿池
         if self.syncing and not self.headers_synced:
             if idx > local_height + 50:
                 print(f"[P2P同步] 丢弃未来广播区块 #{idx}，本地仅 #{local_height}", flush=True)
@@ -3250,33 +3246,6 @@ class XodeNode:
         self._broadcast_inv_for_block(new_block)
         self.broadcast_block(new_block, eligible_users, reward_per_user_atomic, burned, block_transactions, ineligible_users, producer_extra_atomic)
 
-        block_dict = {
-            "index": new_block.index,
-            "timestamp": new_block.timestamp,
-            "previous_hash": new_block.previous_hash,
-            "hash": new_block.hash,
-            "reward_tx": new_block.reward_tx,
-            "transactions": new_block.transactions,
-            "nonce": new_block.nonce,
-            "difficulty": new_block.difficulty,
-            "supply": {
-                "issued": self.total_issued,
-                "issued_atomic": self.total_issued,
-                "total": to_atomic(self.TOTAL_SUPPLY),
-                "total_atomic": to_atomic(self.TOTAL_SUPPLY),
-                "remaining": to_atomic(self.TOTAL_SUPPLY) - self.total_issued,
-                "remaining_atomic": to_atomic(self.TOTAL_SUPPLY) - self.total_issued,
-                "burned_total": self.get_burned_amount(),
-                "burned_total_atomic": self.get_burned_amount()
-            }
-        }
-        self._broadcast_to_peers({
-            "type": "node_new_block",
-            "block": block_dict,
-            "address": self.server_address,
-            "global_online_count": len(unique_online_users)
-        })
-
         remaining = from_atomic(to_atomic(self.TOTAL_SUPPLY) - self.total_issued)
         burned_total = self.get_burned_amount()
 
@@ -3679,7 +3648,7 @@ class XodeNode:
 
         remote_host = addr[0]
         if remote_host not in ('127.0.0.1', 'localhost'):
-            self._add_known_peer(remote_host, remote_port, remote_address, init_data.get("is_producer", False))
+            self._add_known_peer(remote_host, remote_port, remote_address, init_data.get("is_producer", False), is_public=False)
             addr_tuple = (remote_host, remote_port)
             if addr_tuple not in self.peer_addrs:
                 self.peer_addrs.append(addr_tuple)
@@ -3731,12 +3700,15 @@ class XodeNode:
         with self.peer_lock:
             peers_list = []
             for addr_str, info in self.known_peers.items():
+                if not info.get("is_public", False):
+                    continue
                 if ":" in addr_str:
                     host, port = addr_str.rsplit(":", 1)
                     peers_list.append({
                         "host": host,
                         "port": int(port),
-                        "address": info.get("address")
+                        "address": info.get("address"),
+                        "is_public": True
                     })
         peers_msg = {
             "type": "node_peers",
@@ -4411,6 +4383,8 @@ class XodeNode:
                     continue
 
                 self.known_peers[addr_str] = info
+                if "is_public" not in self.known_peers[addr_str]:
+                    self.known_peers[addr_str]["is_public"] = True
                 if ":" in addr_str:
                     host, port = addr_str.rsplit(":", 1)
                     addr_tuple = (host, int(port))
@@ -4493,6 +4467,8 @@ class XodeNode:
                     continue
                 if info.get("address") == self.server_address:
                     continue
+                if not info.get("is_public", False):
+                    continue
                 if addr_str in seen:
                     continue
                 seen.add(addr_str)
@@ -4509,7 +4485,7 @@ class XodeNode:
                     f.write(line + "\n")
 
             if peer_lines:
-                print(f"[P2P种子] 已保存 {len(peer_lines)} 个对等节点到 peers.txt", flush=True)
+                print(f"[P2P种子] 已保存 {len(peer_lines)} 个公网对等节点到 peers.txt", flush=True)
         except Exception as e:
             print(f"[P2P种子] 保存对等节点到 peers.txt 失败: {e}", flush=True)
 
@@ -4662,7 +4638,7 @@ class XodeNode:
         except Exception as e:
             print(f"[P2P] 保存对等节点文件失败: {e}", flush=True)
 
-    def _add_known_peer(self, host, port, address=None, is_producer=None):
+    def _add_known_peer(self, host, port, address=None, is_producer=None, is_public=None):
         addr_str = f"{host}:{port}"
         if host in ('127.0.0.1', 'localhost', '0.0.0.0', self.host):
             if port == self.port:
@@ -4688,6 +4664,15 @@ class XodeNode:
                 changed = True
                 print(f"[P2P] 节点 {addr_str} 模式更新: {old_mode} -> {new_mode}", flush=True)
 
+            if is_public is not None:
+                if is_public and not info.get("is_public", False):
+                    info["is_public"] = True
+                    changed = True
+                    print(f"[P2P] 节点 {addr_str} 标记为公网节点", flush=True)
+                elif not is_public and info.get("is_public") is None:
+                    info["is_public"] = False
+                    changed = True
+
             if changed:
                 self._save_known_peers()
                 self._save_peers_to_txt()
@@ -4698,12 +4683,14 @@ class XodeNode:
             "address": address,
             "first_seen": time.time(),
             "is_producer": is_producer if is_producer is not None else False,
-            "fail_count": 0
+            "fail_count": 0,
+            "is_public": is_public if is_public is not None else False
         }
         self._save_known_peers()
         self._save_peers_to_txt()
         mode_str = "producer" if (is_producer if is_producer is not None else False) else "sync"
-        print(f"[P2P] 新增对等节点: {addr_str} (地址: {address or 'unknown'}, 模式: {mode_str})", flush=True)
+        public_str = "公网" if (is_public if is_public is not None else False) else "非公网"
+        print(f"[P2P] 新增对等节点: {addr_str} (地址: {address or 'unknown'}, 模式: {mode_str}, 类型: {public_str})", flush=True)
         return True
 
     def _connect_to_peer(self, host, port):
@@ -4743,7 +4730,7 @@ class XodeNode:
                 }
 
             print(f"[P2P] 已连接到节点 {host}:{port}", flush=True)
-            self._add_known_peer(host, port)
+            self._add_known_peer(host, port, is_public=True)
             self._save_peers_to_txt()
 
             self._send_online_users_to_peer(sock)
@@ -4861,13 +4848,16 @@ class XodeNode:
             with self.peer_lock:
                 peers_list = []
                 for addr_str, info in self.known_peers.items():
+                    if not info.get("is_public", False):
+                        continue
                     if ":" in addr_str:
                         host, port = addr_str.rsplit(":", 1)
                         peers_list.append({
                             "host": host,
                             "port": int(port),
                             "address": info.get("address"),
-                            "is_producer": info.get("is_producer", False)
+                            "is_producer": info.get("is_producer", False),
+                            "is_public": True
                         })
             peers_msg = {
                 "type": "node_peers",
@@ -5088,11 +5078,6 @@ class XodeNode:
         elif msg_type == "block":
             self._handle_block_message(sock, msg)
 
-        elif msg_type == "node_new_block":
-            block_data = msg.get("block", {})
-            if block_data:
-                self._handle_block_message(sock, {"type": "block", "block": block_data})
-
         elif msg_type == "node_chain_info":
             remote_height = msg.get("block_height", 0)
             remote_address = msg.get("address", "unknown")
@@ -5161,7 +5146,6 @@ class XodeNode:
                 self._handle_block_message(sock, {"type": "block", "block": block_data})
 
     def _handle_getheaders(self, sock, msg):
-        # 频率限制：单个对等节点 5 秒内只能请求一次
         with self.peer_lock:
             if sock in self.peer_sockets:
                 last = self.peer_sockets[sock].get("last_getheaders", 0)
@@ -5290,7 +5274,6 @@ class XodeNode:
 
         success = self._try_connect_block(block_data)
 
-        # 流水线调度
         if self.syncing and self.sync_peer:
             with self.sync_lock:
                 if h in self.sync_block_queue:
@@ -5314,8 +5297,7 @@ class XodeNode:
                             pass
 
             self._print_synced_block(block_data)
-    
-        # 同步期间每处理一个区块都尝试连接孤儿块，防止顺序错乱导致卡住
+
         self._process_orphan_blocks()
 
         with self.sync_lock:
@@ -5604,7 +5586,6 @@ class XodeNode:
         print(f"[P2P同步] 从节点 {peer_info.get('host', '?')}:{peer_info.get('port', '?')} 同步，远程高度: {best_height}", flush=True)
         self.sync_peer = best_peer
 
-        # 直接分批请求缺失的完整区块
         batch_size = 50
         last_height = local_height
         stall_time = time.time()
@@ -5635,7 +5616,7 @@ class XodeNode:
                 if current_height >= end - 1:
                     break
 
-                if waited > 100:  # 30秒超时
+                if waited > 100:
                     re_request_count += 1
                     if re_request_count > max_re_requests:
                         print(f"[P2P同步] 重试次数超限({max_re_requests})，放弃同步", flush=True)
@@ -5895,13 +5876,16 @@ class XodeNode:
                     continue
                 peers_list = []
                 for addr_str, info in self.known_peers.items():
+                    if not info.get("is_public", False):
+                        continue
                     if ":" in addr_str:
                         host, port = addr_str.rsplit(":", 1)
                         peers_list.append({
                             "host": host,
                             "port": int(port),
                             "address": info.get("address"),
-                            "is_producer": info.get("is_producer", False)
+                            "is_producer": info.get("is_producer", False),
+                            "is_public": True
                         })
 
             if peers_list:
@@ -5920,8 +5904,6 @@ class XodeNode:
                 break
             msg = {"type": "node_ping", "address": self.server_address, "timestamp": time.time()}
             self._broadcast_to_peers(msg)
-
-            # 高度信息在 version 握手时已交换，后续靠新块 inv 广播即可
 
             hashrate_msg = {
                 "type": "node_hashrate",
@@ -6058,7 +6040,6 @@ class XodeNode:
 
         print(f"[出块] 链已就绪，当前高度 #{len(self.chain)-1}，开始挖矿竞争", flush=True)
 
-        # ===== 启动预热保护：确保P2P连接和版本交换完成后再挖矿 =====
         if self.is_producer:
             warmup_start = time.time()
             while self.running:
@@ -6075,10 +6056,6 @@ class XodeNode:
                         if info.get("hashrate", 0) > 0 and info.get("connected")
                     )
 
-                # 退出预热条件：
-                # 1. 启动至少60秒（给P2P握手留时间）
-                # 2. 本地高度 >= 已知最高对等节点高度（链已同步）
-                # 3. 要么连接了其他生产者，要么网络中没有其他节点（单节点网络）
                 is_synced = local_height >= max_peer_height
                 has_peer_producers = connected_producers > 0
                 no_higher_peers = max_peer_height < 0
@@ -6092,7 +6069,6 @@ class XodeNode:
                       f"高度:{local_height}/{max(max_peer_height, local_height)} "
                       f"生产者连接:{connected_producers}，暂不挖矿", flush=True)
                 time.sleep(5)
-        # ===== 预热结束 =====
 
         while self.running:
             if not self.running:
@@ -6111,7 +6087,6 @@ class XodeNode:
         print("[出块] 出块循环已停止", flush=True)
 
     def mempool_cleanup_loop(self):
-        print(f'[Mempool]每10分钟检查一次', flush=True)
         while self.running:
             time.sleep(600)
             if not self.running:
@@ -6134,7 +6109,6 @@ class XodeNode:
 
 
     def scan_address_history(self):
-        """Scan entire blockchain for transactions related to node wallet address."""
         my_addr = self.wallet.address
         if not my_addr:
             return
@@ -6146,6 +6120,7 @@ class XodeNode:
             idx = block.index
             ts = block.timestamp
 
+            # Check reward_tx recipients
             reward_tx = block.reward_tx or {}
             for r in reward_tx.get("recipients", []):
                 addr = r.get("address")
@@ -6171,6 +6146,7 @@ class XodeNode:
                         "maturity_block": idx + REWARD_CONFIRMATIONS
                     })
 
+            # Check transactions
             for tx in block.transactions:
                 tx_from = tx.get("from")
                 tx_to = tx.get("to")
@@ -6184,6 +6160,7 @@ class XodeNode:
                         tx_copy["direction"] = "in"
                     history.append(tx_copy)
 
+        # Sort by block_index ascending
         history.sort(key=lambda x: (x.get("block_index", 0), x.get("timestamp", 0)))
         self.address_history = history
         self.save_address_history()
@@ -6501,9 +6478,9 @@ class XodeNode:
             self.explorer_thread = threading.Thread(target=self.explorer_server.serve_forever, daemon=True)
             self.explorer_thread.start()
             print("=" * 60, flush=True)
-            print("[浏览器] Web已启动", flush=True)
-            print("[浏览器] 访问地址: http://127.0.0.1:" + str(port), flush=True)
-            print("[浏览器] 局域网地址: http://0.0.0.0:" + str(port), flush=True)
+            print("Web已启动", flush=True)
+            print("访问地址: http://127.0.0.1:" + str(port), flush=True)
+            print("局域网地址: http://0.0.0.0:" + str(port), flush=True)
             print("=" * 60, flush=True)
         except Exception as e:
             print("[浏览器] 启动失败: " + str(e), flush=True)
@@ -6521,7 +6498,7 @@ class XodeNode:
 
             print("=" * 60, flush=True)
             print("XODE 区块链节点服务器", flush=True)
-            # 启动区块浏览器
+
             explorer_port = getattr(self, 'explorer_port', 0)
             if explorer_port > 0:
                 self.start_explorer(port=explorer_port)
@@ -6651,16 +6628,16 @@ if __name__ == "__main__":
     import argparse
     import sys
 
-    # 如果没有传入任何命令行参数（双击启动），则提供交互式选择
     if len(sys.argv) == 1:
         print("=" * 60, flush=True)
-        print("           XODE NODE           ", flush=True)
         print("=" * 60, flush=True)
         print("请选择节点运行模式:", flush=True)
         print("", flush=True)
         print("  [1] 出块节点 (Producer)", flush=True)
+        print("      参与 POW", flush=True)
         print("", flush=True)
         print("  [2] 同步节点 (Sync)", flush=True)
+        print("      仅同步区块链数据", flush=True)
         print("=" * 60, flush=True)
         
         while True:
